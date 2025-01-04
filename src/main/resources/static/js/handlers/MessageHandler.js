@@ -3,7 +3,6 @@ const MessageHandler = {
         try {
             const message = JSON.parse(event.data);
             console.log('Received message:', message);
-            WebSocketManager.lastHeartbeatResponse = Date.now();
 
             switch (message.type) {
                 case 'CHAT':
@@ -62,21 +61,14 @@ const MessageHandler = {
 
     handleAck(message) {
         console.log('Received ACK message:', message);
-        // 更新消息状态
-        if (message.status === 'DELIVERED') {
-            UIManager.updateMessageStatus(message.ackMessageId, 'DELIVERED');
-        } else if (message.status === 'SENT') {
-            UIManager.updateMessageStatus(message.ackMessageId, 'SENT');
-        } else if (message.status === 'FAILED') {
-            UIManager.updateMessageStatus(message.ackMessageId, 'FAILED');
-        }
+        // 更新消息状态并清除重试
+        MessageManager.handleAck(message);
     },
 
     handleBatchAck(message) {
+        console.log('Received BATCH_ACK message:', message);
         if (message.batchAckMessageIds) {
-            message.batchAckMessageIds.forEach(messageId => {
-                UIManager.updateMessageStatus(messageId, 'DELIVERED');
-            });
+            MessageManager.handleAck(message);
         }
     },
 

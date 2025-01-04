@@ -16,11 +16,18 @@ const MessageManager = {
 
         console.log("Sending message:", message);
 
+        // 检查消息是否已经在待确认列表中
+        if (this.pendingMessages.has(message.messageId)) {
+            console.warn('Message already in pending list:', message.messageId);
+            return message.messageId;
+        }
+
         // 存储消息到待确认列表
         this.pendingMessages.set(message.messageId, {
             message,
             retries: 0,
-            timestamp: Date.now()
+            timestamp: Date.now(),
+            retryTimer: null
         });
 
         try {
@@ -40,6 +47,7 @@ const MessageManager = {
     },
 
     handleAck(ackMessage) {
+        console.log('Processing ACK:', ackMessage);
         if (ackMessage.batchAckMessageIds) {
             // 处理批量确认
             ackMessage.batchAckMessageIds.forEach(messageId => {
@@ -52,11 +60,13 @@ const MessageManager = {
     },
 
     confirmMessage(messageId) {
+        console.log('Confirming message:', messageId);
         const pendingMessage = this.pendingMessages.get(messageId);
         if (pendingMessage) {
             // 清除重试计时器
             if (pendingMessage.retryTimer) {
                 clearTimeout(pendingMessage.retryTimer);
+                pendingMessage.retryTimer = null;
             }
             
             // 从待确认列表中移除
@@ -127,10 +137,9 @@ const MessageManager = {
                     console.log(`Message ${messageId} failed after ${this.retryCount} attempts`);
                     this.pendingMessages.delete(messageId);
                     UIManager.updateMessageStatus(messageId, 'FAILED');
-                    UIManager.showSystemMessage('Message delivery failed');
                 }
             }
-        }, this.retryInterval * Math.pow(2, pendingMessage.retries)); // 使用指数退避
+        }, this.retryInterval * Math.pow(2, pendingMessage.retries));
     },
 
     generateMessageId() {
