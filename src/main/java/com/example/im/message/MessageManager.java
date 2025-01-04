@@ -1,237 +1,179 @@
 package com.example.im.message;
 
-import com.example.im.channel.IMChannel;
 import com.example.im.protocol.Message;
+import com.example.im.config.WebSocketHandler;
 import com.example.im.service.ChatMessageService;
-import com.google.gson.Gson;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Component;
 
-import javax.annotation.PostConstruct;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ConcurrentHashMap;
 
+@Slf4j
 @Component
 public class MessageManager {
-    private static final Logger logger = LoggerFactory.getLogger(MessageManager.class);
-    private static final Gson gson = new Gson();
-    
-    // 待确认的消息队列
     private final Map<String, PendingMessage> pendingMessages = new ConcurrentHashMap<>();
-    
-    // 重传调度器
-    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
-    
-    // 消息持久化队列
-    private final BlockingQueue<Message> persistQueue = new LinkedBlockingQueue<>();
-    
-    // 消息持久化线程
-    private final ExecutorService persistExecutor = Executors.newSingleThreadExecutor();
+    private final List<String> messageQueue = new ArrayList<>();
+    private final int retryCount = 3;
+    private final long retryInterval = 3000;
+    private final int batchSize = 10;
+    private final List<String> pendingAcks = new ArrayList<>();
 
-    // 修改重传任务的配置
-    private static final int RETRY_DELAY = 3; // 3秒后开始重传
-    private static final int MAX_RETRIES = 3; // 最大重试次数
-    private static final int BATCH_SIZE = 10;  // 批量确认大小
-    private static final long BATCH_TIMEOUT = 5000;  // 批量确认超时时间(ms)
-    private final Map<String, List<String>> pendingAcks = new ConcurrentHashMap<>(); // 用户待确认消息队列
+    @Autowired
+    @Lazy
+    private WebSocketHandler webSocketHandler;
 
     @Autowired
     private ChatMessageService chatMessageService;
 
-    public MessageManager() {
-        // 启动消息持久化线程
-        startPersistThread();
-    }
-
-    // 发送消息
-    public void sendMessage(IMChannel channel, Message message) {
-        message.setMessageId(UUID.randomUUID().toString());
+    public String sendMessage(Message message) {
+        if (message.getMessageId() == null) {
+            message.setMessageId(generateMessageId());
+        }
         message.setTimestamp(System.currentTimeMillis());
         message.setNeedAck(true);
+        message.setStatus(Message.Status.SENDING);
 
-        PendingMessage pendingMessage = new PendingMessage(message, channel);
-        pendingMessages.put(message.getMessageId(), pendingMessage);
+        log.debug("Sending message: {}", message);
 
-        // 添加到用户的待确认队列
-        pendingAcks.computeIfAbsent(message.getTo(), k -> new CopyOnWriteArrayList<>())
-                  .add(message.getMessageId());
+        // 存储消息到待确认列表
+        pendingMessages.put(message.getMessageId(), new PendingMessage(
+                message,
+                0,
+                System.currentTimeMillis()
+        ));
 
-        channel.writeAndFlush(gson.toJson(message));
-        scheduleRetry(pendingMessage);
-        persistQueue.offer(message);
-
-        // 保存消息到数据库
         try {
-            chatMessageService.saveMessage(message);
+            // 发送消息
+            webSocketHandler.sendMessage(message);
+
+            // 启动重试计时器
+            scheduleRetry(message.getMessageId());
+
+            return message.getMessageId();
         } catch (Exception e) {
-            logger.error("Error saving message to database", e);
-        }
-
-        // 检查是否需要触发批量确认
-        checkBatchAck(message.getTo());
-    }
-
-    // 检查是否需要触发批量确认
-    private void checkBatchAck(String username) {
-        List<String> userPendingAcks = pendingAcks.get(username);
-        if (userPendingAcks != null && userPendingAcks.size() >= BATCH_SIZE) {
-            triggerBatchAck(username);
+            log.error("Failed to send message: {}", message.getMessageId(), e);
+            pendingMessages.remove(message.getMessageId());
+            webSocketHandler.updateMessageStatus(message.getMessageId(), Message.Status.FAILED);
+            return null;
         }
     }
 
-    // 触发批量确认
-    private void triggerBatchAck(String username) {
-        List<String> userPendingAcks = pendingAcks.get(username);
-        if (userPendingAcks == null || userPendingAcks.isEmpty()) {
-            return;
-        }
-
-        List<String> batchAcks = new ArrayList<>(userPendingAcks);
-        userPendingAcks.clear();
-
-        Message batchAckMessage = new Message();
-        batchAckMessage.setType(Message.MessageType.BATCH_ACK);
-        batchAckMessage.setBatchAckMessageIds(batchAcks);
-        batchAckMessage.setTimestamp(System.currentTimeMillis());
-
-        // 通知消息发送者
-        for (String messageId : batchAcks) {
-            PendingMessage pendingMessage = pendingMessages.get(messageId);
-            if (pendingMessage != null) {
-                pendingMessage.getMessage().setStatus(Message.MessageStatus.DELIVERED);
-                pendingMessage.getChannel().writeAndFlush(gson.toJson(batchAckMessage));
-            }
-        }
-    }
-
-    // 处理批量确认
-    public void handleBatchAck(Message batchAckMessage) {
-        List<String> messageIds = batchAckMessage.getBatchAckMessageIds();
-        if (messageIds != null) {
-            for (String messageId : messageIds) {
-                PendingMessage pendingMessage = pendingMessages.remove(messageId);
-                if (pendingMessage != null) {
-                    pendingMessage.cancelRetry();
-                    logger.info("Message {} has been acknowledged in batch", messageId);
-                }
-            }
-        }
-    }
-
-    // 启动定时批量确认任务
-    @PostConstruct
-    public void startBatchAckScheduler() {
-        scheduler.scheduleAtFixedRate(() -> {
-            pendingAcks.forEach((username, acks) -> {
-                if (!acks.isEmpty()) {
-                    triggerBatchAck(username);
-                }
-            });
-        }, BATCH_TIMEOUT, BATCH_TIMEOUT, TimeUnit.MILLISECONDS);
-    }
-
-    // 处理消息确认
     public void handleAck(Message ackMessage) {
-        String messageId = ackMessage.getAckMessageId();
+        log.debug("Handling ACK message: {}", ackMessage);
+
+        if (ackMessage.getBatchAckMessageIds() != null) {
+            // 处理批量确认
+            ackMessage.getBatchAckMessageIds().forEach(this::confirmMessage);
+        } else if (ackMessage.getAckMessageId() != null) {
+            // 处理单条确认
+            confirmMessage(ackMessage.getAckMessageId());
+        }
+    }
+
+    private void confirmMessage(String messageId) {
+        log.debug("Confirming message: {}", messageId);
+
         PendingMessage pendingMessage = pendingMessages.remove(messageId);
         if (pendingMessage != null) {
-            // 取消重传任务
-            pendingMessage.cancelRetry();
-            logger.info("Message {} has been acknowledged", messageId);
+            // 更新消息状态
+            webSocketHandler.updateMessageStatus(messageId, Message.Status.DELIVERED);
         }
     }
 
-    // 安排重传任务
-    private void scheduleRetry(PendingMessage pendingMessage) {
-        AtomicInteger retryCount = new AtomicInteger(0);
-        
-        ScheduledFuture<?> retryFuture = scheduler.scheduleWithFixedDelay(() -> {
-            if (pendingMessages.containsKey(pendingMessage.getMessage().getMessageId())) {
-                if (retryCount.incrementAndGet() > MAX_RETRIES) {
-                    // 超过最大重试次数
-                    logger.error("Message {} failed after {} retries", 
-                        pendingMessage.getMessage().getMessageId(), MAX_RETRIES);
-                    pendingMessages.remove(pendingMessage.getMessage().getMessageId());
-                    pendingMessage.cancelRetry();
-                    return;
-                }
+    public void handleIncomingMessage(Message message) {
+        log.debug("Handling incoming message: {}", message);
 
-                IMChannel channel = pendingMessage.getChannel();
-                if (channel != null && channel.isActive()) {
-                    logger.info("Retrying message: {} (attempt: {})", 
-                        pendingMessage.getMessage().getMessageId(), retryCount.get());
-                    channel.writeAndFlush(gson.toJson(pendingMessage.getMessage()));
-                } else {
-                    // 通道已关闭，取消重试
-                    logger.warn("Channel is inactive, canceling retry for message: {}", 
-                        pendingMessage.getMessage().getMessageId());
-                    pendingMessages.remove(pendingMessage.getMessage().getMessageId());
-                    pendingMessage.cancelRetry();
-                }
+        // 显示接收到的消息
+        webSocketHandler.handleIncomingMessage(message);
+
+        if (message.isNeedAck()) {
+            // 将确认消息添加到队列
+            pendingAcks.add(message.getMessageId());
+
+            // 如果队列达到批量大小或者是第一个确认，启动批量发送
+            if (pendingAcks.size() >= batchSize) {
+                sendBatchAck();
+            } else if (pendingAcks.size() == 1) {
+                scheduleAckSend();
             }
-        }, RETRY_DELAY, RETRY_DELAY, TimeUnit.SECONDS);
-
-        pendingMessage.setRetryFuture(retryFuture);
+        }
     }
 
-    // 启动消息持久化线程
-    private void startPersistThread() {
-        persistExecutor.submit(() -> {
-            while (true) {
-                try {
-                    Message message = persistQueue.take();
-                    // TODO: 实现具体的消息持久化逻辑，例如写入数据库
-                    logger.info("Persisting message: {}", message.getMessageId());
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                } catch (Exception e) {
-                    logger.error("Error persisting message", e);
+    private void scheduleRetry(String messageId) {
+        PendingMessage pendingMessage = pendingMessages.get(messageId);
+        if (pendingMessage == null) return;
+
+        new Thread(() -> {
+            try {
+                Thread.sleep(retryInterval);
+                if (pendingMessages.containsKey(messageId)) {
+                    if (pendingMessage.getRetries() < retryCount) {
+                        pendingMessage.setRetries(pendingMessage.getRetries() + 1);
+                        log.debug("Retrying message: {} (attempt {})", messageId, pendingMessage.getRetries());
+                        webSocketHandler.sendMessage(pendingMessage.getMessage());
+                        scheduleRetry(messageId);
+                        webSocketHandler.updateMessageStatus(messageId, Message.Status.SENDING);
+                    } else {
+                        log.warn("Message {} failed after {} retries", messageId, retryCount);
+                        pendingMessages.remove(messageId);
+                        webSocketHandler.updateMessageStatus(messageId, Message.Status.FAILED);
+                    }
                 }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.error("Retry interrupted for message: {}", messageId, e);
+            } catch (Exception e) {
+                log.error("Error retrying message: {}", messageId, e);
+                pendingMessages.remove(messageId);
+                webSocketHandler.updateMessageStatus(messageId, Message.Status.FAILED);
             }
-        });
+        }).start();
     }
 
-    // 关闭资源
-    public void shutdown() {
-        scheduler.shutdown();
-        persistExecutor.shutdown();
+    private void scheduleAckSend() {
+        new Thread(() -> {
+            try {
+                Thread.sleep(1000);
+                sendBatchAck();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.error("ACK send interrupted", e);
+            }
+        }).start();
     }
 
-    // 待确认消息的封装类
+    private void sendBatchAck() {
+        if (pendingAcks.isEmpty()) return;
+
+        Message ackMessage = new Message();
+        ackMessage.setType(Message.Type.BATCH_ACK);
+        ackMessage.setBatchAckMessageIds(new ArrayList<>(pendingAcks));
+        ackMessage.setTimestamp(System.currentTimeMillis());
+
+        try {
+            webSocketHandler.sendMessage(ackMessage);
+            pendingAcks.clear();
+        } catch (Exception e) {
+            log.error("Failed to send batch ACK", e);
+        }
+    }
+
+    private String generateMessageId() {
+        return System.currentTimeMillis() + "-" + Math.random();
+    }
+
+    @Data
+    @AllArgsConstructor
     private static class PendingMessage {
-        private final Message message;
-        private final IMChannel channel;
-        private ScheduledFuture<?> retryFuture;
-
-        public PendingMessage(Message message, IMChannel channel) {
-            this.message = message;
-            this.channel = channel;
-        }
-
-        public Message getMessage() {
-            return message;
-        }
-
-        public IMChannel getChannel() {
-            return channel;
-        }
-
-        public void setRetryFuture(ScheduledFuture<?> retryFuture) {
-            this.retryFuture = retryFuture;
-        }
-
-        public void cancelRetry() {
-            if (retryFuture != null) {
-                retryFuture.cancel(false);
-            }
-        }
+        private Message message;
+        private int retries;
+        private long timestamp;
     }
 } 

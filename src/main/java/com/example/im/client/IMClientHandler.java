@@ -4,10 +4,12 @@ import com.example.im.protocol.Message;
 import com.google.gson.Gson;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
+import lombok.extern.slf4j.Slf4j;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class IMClientHandler extends SimpleChannelInboundHandler<String> {
+@Slf4j
+public class IMClientHandler extends SimpleChannelInboundHandler<Message> {
     private static final Logger logger = LoggerFactory.getLogger(IMClientHandler.class);
     private static final Gson gson = new Gson();
     private ChannelHandlerContext context;
@@ -19,32 +21,35 @@ public class IMClientHandler extends SimpleChannelInboundHandler<String> {
     }
 
     @Override
-    protected void channelRead0(ChannelHandlerContext ctx, String msg) {
-        Message message = gson.fromJson(msg, Message.class);
+    protected void channelRead0(ChannelHandlerContext ctx, Message msg) {
+        log.debug("Received message: {}", msg);
         
-        switch (message.getType()) {
+        switch (msg.getType()) {
             case HEARTBEAT:
-                handleHeartbeat(ctx, message);
+                handleHeartbeat(ctx, msg);
                 break;
             case CHAT:
-                handleChatMessage(message);
+                handleChatMessage(msg);
                 break;
             case ACK:
-                handleAck(message);
+                handleAck(msg);
                 break;
             case READ_RECEIPT:
-                handleReadReceipt(message);
+                handleReadReceipt(msg);
                 break;
             default:
                 logger.info("Received message: {}", msg);
         }
     }
 
-    private void handleHeartbeat(ChannelHandlerContext ctx, Message message) {
+    private void handleHeartbeat(ChannelHandlerContext ctx, Message msg) {
         Message response = new Message();
-        response.setType(Message.MessageType.HEARTBEAT_RESPONSE);
+        response.setType(Message.Type.HEARTBEAT);
+        response.setFrom(msg.getTo());
+        response.setTo(msg.getFrom());
         response.setTimestamp(System.currentTimeMillis());
-        ctx.writeAndFlush(gson.toJson(response));
+        
+        ctx.writeAndFlush(response);
     }
 
     private void handleChatMessage(Message message) {
@@ -53,7 +58,7 @@ public class IMClientHandler extends SimpleChannelInboundHandler<String> {
         // 发送确认消息
         if (message.isNeedAck()) {
             Message ack = new Message();
-            ack.setType(Message.MessageType.ACK);
+            ack.setType(Message.Type.ACK);
             ack.setAckMessageId(message.getMessageId());
             ack.setFrom(message.getTo());
             ack.setTo(message.getFrom());

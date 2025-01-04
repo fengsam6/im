@@ -20,4 +20,14 @@ public class ChatController {
             @RequestParam(defaultValue = "50") int limit) {
         return chatMessageService.getChatHistory(user1, user2, limit);
     }
+
+    @GetMapping("/messages")
+    public List<ChatMessage> getUserMessages(@RequestParam String username) {
+        return chatMessageService.getUserMessages(username);
+    }
+
+    @GetMapping("/unread")
+    public List<ChatMessage> getUnreadMessages(@RequestParam String username) {
+        return chatMessageService.getUnreadMessages(username);
+    }
 } 

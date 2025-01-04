@@ -5,15 +5,23 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
-import org.springframework.data.domain.Pageable;
 
 import java.util.List;
+import java.util.Optional;
 
 @Repository
-public interface ChatMessageRepository extends JpaRepository<ChatMessage, Long> {
-    @Query("SELECT m FROM ChatMessage m WHERE (m.fromUser = :user1 AND m.toUser = :user2) OR (m.fromUser = :user2 AND m.toUser = :user1) ORDER BY m.timestamp DESC")
+public interface ChatMessageRepository extends JpaRepository<ChatMessage, String> {
+    Optional<ChatMessage> findByMessageId(String messageId);
+
+    @Query(value = "SELECT m FROM ChatMessage m WHERE " +
+           "(m.from = :user1 AND m.to = :user2) OR " +
+           "(m.from = :user2 AND m.to = :user1) " +
+           "ORDER BY m.timestamp DESC")
     List<ChatMessage> findChatHistory(
-            @Param("user1") String user1, 
-            @Param("user2") String user2, 
-            Pageable pageable);
+        @Param("user1") String user1,
+        @Param("user2") String user2);
+
+    List<ChatMessage> findByToOrderByTimestampDesc(String to);
+
+    List<ChatMessage> findByToAndStatusOrderByTimestampDesc(String to, ChatMessage.Status status);
 } 
